@@ -302,7 +302,7 @@ def handle_adhoc(from_number: str):
 
 
 # ─── Twilio webhook ──────────────────────────────────────────────────────────
-@app.route("/webhook/whatsapp", methods=["POST"])
+@app.route("/webhook/whatsapp", methods=["GET", "POST"])
 def whatsapp_webhook():
     from_number = request.form.get("From", "").replace("whatsapp:", "")
     body        = request.form.get("Body", "").strip()
@@ -391,7 +391,7 @@ def list_subscribers():
     subs = subscribers.get_all()
     return jsonify({"subscribers": subs, "count": len(subs)})
 
-@app.route("/trigger/<slot>", methods=["POST"])
+@app.route("/trigger/<slot>", methods=["GET", "POST"])
 def trigger_alert(slot):
     """Manual trigger: open | 10am | 11am | noon | 1pm | 2pm | 230pm | closing"""
     mapping = {
