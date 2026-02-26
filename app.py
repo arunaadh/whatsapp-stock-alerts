@@ -1,5 +1,6 @@
 import os
 import logging
+import threading
 from flask import Flask, request, jsonify
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -16,6 +17,10 @@ logging.basicConfig(
     format="%(asctime)s  %(levelname)-8s  %(name)s – %(message)s",
 )
 log = logging.getLogger(__name__)
+
+# ─── TwiML helper ─────────────────────────────────────────────────────────────
+TWIML_OK = ('<?xml version="1.0" encoding="UTF-8"?><Response></Response>',
+            200, {"Content-Type": "text/xml"})
 
 # ─── App & Services ──────────────────────────────────────────────────────────
 app         = Flask(__name__)
@@ -71,7 +76,7 @@ def _broadcast(message: str):
             log.error(f"  ✗ {num}: {e}")
 
 
-# ─── Scheduled alert job (one handler for ALL slots) ─────────────────────────
+# ─── Scheduled alert job ─────────────────────────────────────────────────────
 def run_scheduled_alert(hour: int, minute: int = 0):
     dt    = now_ist()
     label = SLOT_LABELS.get((hour, minute), f"📣 {hour:02d}:{minute:02d} UPDATE")
@@ -163,12 +168,10 @@ def _footer(report: dict, extras: list = None) -> list:
 def _divider(title: str) -> list:
     return ["", "━━━━━━━━━━━━━━━━━━━━━━", f"🎯  *{title}*", "━━━━━━━━━━━━━━━━━━━━━━"]
 
-# ── Scheduled (open / intraday / closing) ────────────────────────────────────
 def format_scheduled_message(report: dict, label: str, mode: str) -> str:
     lines = _header(label, report)
     if report.get("theme"):
         lines.append(f"📰  {report['theme']}")
-
     if mode == "open":
         lines += _divider("TOP PICKS – TODAY")
     elif mode == "closing":
@@ -177,20 +180,16 @@ def format_scheduled_message(report: dict, label: str, mode: str) -> str:
             lines.insert(4, f"📋  {report['day_summary']}")
     else:
         lines += _divider("LIVE INTRADAY PICKS")
-
     for i, s in enumerate(report.get("stocks", [])[:3], 1):
         lines += _stock_lines(i, s, show_hold=(mode != "intraday"))
-
     extras = []
     if mode == "closing" and report.get("next_day_outlook"):
         extras.append(f"\n🔭  *Tomorrow* : {report['next_day_outlook']}")
     if report.get("global_cues"):
         extras.append(f"🌐  *Global*   : {report['global_cues']}")
-
     lines += _footer(report, extras)
     return "\n".join(lines)
 
-# ── Ad-hoc (during market hours) ─────────────────────────────────────────────
 def format_adhoc_message(report: dict) -> str:
     lines = _header("📲  INSTANT PICKS", report)
     lines += _divider("BEST PICKS RIGHT NOW")
@@ -199,7 +198,6 @@ def format_adhoc_message(report: dict) -> str:
     lines += _footer(report)
     return "\n".join(lines)
 
-# ── Pre-open ──────────────────────────────────────────────────────────────────
 def format_pre_open_message(report: dict) -> str:
     lines = _header("🌄  PRE-MARKET WATCHLIST", report)
     lines.append(f"⏰  Gift Nifty : {report.get('nifty_open_estimate','N/A')}")
@@ -212,7 +210,6 @@ def format_pre_open_message(report: dict) -> str:
     lines += _footer(report, extras)
     return "\n".join(lines)
 
-# ── Night / post-close ────────────────────────────────────────────────────────
 def format_night_message(report: dict) -> str:
     stocks = report.get("stocks", [])
     dt     = now_ist()
@@ -245,7 +242,6 @@ def format_night_message(report: dict) -> str:
     ]
     return "\n".join(lines)
 
-# ── Weekend ────────────────────────────────────────────────────────────────────
 def format_weekend_message(report: dict) -> str:
     stocks = report.get("stocks", [])
     dt     = now_ist()
@@ -275,11 +271,16 @@ def format_weekend_message(report: dict) -> str:
     return "\n".join(lines)
 
 
-# ─── Smart ad-hoc dispatcher ─────────────────────────────────────────────────
+# ─── Smart ad-hoc dispatcher (runs in background thread) ─────────────────────
 def handle_adhoc(from_number: str):
+    """
+    Runs in a background thread so the webhook can return 200 to Twilio
+    immediately. Claude + web search takes 20-60s — far beyond Twilio's
+    15-second timeout if run synchronously.
+    """
     dt      = now_ist()
     session = market_session(dt)
-    log.info(f"  Ad-hoc [{from_number}]  session={session}")
+    log.info(f"  [thread] Ad-hoc [{from_number}] session={session}")
 
     try:
         if session == "market":
@@ -296,83 +297,121 @@ def handle_adhoc(from_number: str):
             reply  = format_weekend_message(report)
     except Exception as e:
         log.error(f"Ad-hoc report error: {e}")
-        reply = f"⚠️ Could not generate picks right now.\nPlease retry in a moment.\n\n_{e}_"
+        reply = (
+            "⚠️  Sorry, couldn't generate picks right now.\n"
+            "Please try again in a minute.\n\n"
+            f"_{str(e)[:120]}_"
+        )
 
-    whatsapp.send_message(from_number, reply)
+    try:
+        whatsapp.send_message(from_number, reply)
+    except Exception as e:
+        log.error(f"Failed to deliver ad-hoc reply to {from_number}: {e}")
+
+
+def _spawn_adhoc(from_number: str):
+    """Fire-and-forget: run handle_adhoc in a daemon thread."""
+    t = threading.Thread(target=handle_adhoc, args=(from_number,), daemon=True)
+    t.start()
 
 
 # ─── Twilio webhook ──────────────────────────────────────────────────────────
 @app.route("/webhook/whatsapp", methods=["GET", "POST"])
 def whatsapp_webhook():
-    from_number = request.form.get("From", "").replace("whatsapp:", "")
-    body        = request.form.get("Body", "").strip()
-    cmd         = body.lower()
-    dt          = now_ist()
-    session     = market_session(dt)
+    # Twilio sends GET to verify the URL — respond with empty TwiML
+    if request.method == "GET":
+        return TWIML_OK
 
-    log.info(f"📩 [{from_number}] '{body}'  session={session}")
+    try:
+        from_number = request.form.get("From", "").replace("whatsapp:", "").strip()
+        body        = request.form.get("Body", "").strip()
+        cmd         = body.lower()
+        dt          = now_ist()
+        session     = market_session(dt)
 
-    # ── Subscription ─────────────────────────────────────────────────────────
-    if cmd in ("start", "subscribe", "hi", "hello", "hey"):
-        subscribers.add(from_number)
-        reply = (
-            "✅  *Subscribed to India Stock Alerts!*\n\n"
-            "📅  *Automated Alerts (Mon–Fri IST)*\n"
-            "   9:20 AM  – Market Open Picks\n"
-            "  10:00 AM  – Hourly Update\n"
-            "  11:00 AM  – Hourly Update\n"
-            "  12:00 PM  – Noon Update\n"
-            "   1:00 PM  – Hourly Update\n"
-            "   2:00 PM  – Hourly Update\n"
-            "   2:30 PM  – Pre-Close Picks\n"
-            "   3:00 PM  – Closing Picks\n\n"
-            "📲  *Message anytime* for instant picks!\n"
-            "   • Market hours  → Live intraday picks\n"
-            "   • Night time    → Tomorrow's watchlist\n"
-            "   • Weekend       → Next week's picks\n\n"
-            "Commands: *stop* | *picks* | *help*\n\n"
-            "⚠️  For educational purposes only."
-        )
-        whatsapp.send_message(from_number, reply)
-        return jsonify({"status": "ok"})
+        log.info(f"📩 [{from_number}] '{body}'  session={session}")
 
-    elif cmd in ("stop", "unsubscribe"):
-        subscribers.remove(from_number)
-        reply = "❌  Unsubscribed. Send *start* to re-subscribe anytime."
-        whatsapp.send_message(from_number, reply)
-        return jsonify({"status": "ok"})
+        if not from_number:
+            log.warning("Webhook called with no From number")
+            return TWIML_OK
 
-    elif cmd == "help":
-        reply = (
-            "📋  *Commands*\n\n"
-            "  *start*  – Subscribe to auto alerts\n"
-            "  *stop*   – Unsubscribe\n"
-            "  *picks*  – Instant stock picks\n"
-            "  *help*   – This menu\n\n"
-            "💡  Or send *any message* for smart picks!\n\n"
-            "Smart picks adapt to the time:\n"
-            "  📈 Market hours → Intraday picks\n"
-            "  🌙 Night time   → Tomorrow's watchlist\n"
-            "  📅 Weekend      → Next week picks"
-        )
-        whatsapp.send_message(from_number, reply)
-        return jsonify({"status": "ok"})
+        # ── Subscription commands ─────────────────────────────────────────────
+        if cmd in ("start", "subscribe", "hi", "hello", "hey"):
+            subscribers.add(from_number)
+            reply = (
+                "✅  *Subscribed to India Stock Alerts!*\n\n"
+                "📅  *Automated Alerts (Mon–Fri IST)*\n"
+                "    9:20 AM  – Market Open Picks\n"
+                "   10:00 AM  – Hourly Update\n"
+                "   11:00 AM  – Hourly Update\n"
+                "   12:00 PM  – Noon Update\n"
+                "    1:00 PM  – Hourly Update\n"
+                "    2:00 PM  – Hourly Update\n"
+                "    2:30 PM  – Pre-Close Picks\n"
+                "    3:00 PM  – Closing Picks\n\n"
+                "📲  *Message anytime* for instant picks!\n"
+                "    Market hours  → Live intraday picks\n"
+                "    Night time    → Tomorrow's watchlist\n"
+                "    Weekend       → Next week's picks\n\n"
+                "Commands: *stop* | *picks* | *help*\n\n"
+                "⚠️  For educational purposes only."
+            )
+            try:
+                whatsapp.send_message(from_number, reply)
+            except Exception as e:
+                log.error(f"Failed to send subscribe reply: {e}")
 
-    # ── Any other message → smart ad-hoc picks ───────────────────────────────
-    else:
-        subscribers.add(from_number)   # auto-subscribe on first message
-        # Send instant "please wait" acknowledgment
-        wait_msg = {
-            "market"    : "🔍  Analyzing live market data... ~30 sec ⏳",
-            "pre_open"  : "🌄  Checking pre-market signals... ~30 sec ⏳",
-            "post_close": "📊  Building tomorrow's watchlist... ~30 sec ⏳",
-            "night"     : "🌙  Preparing tomorrow's picks... ~30 sec ⏳",
-            "weekend"   : "📅  Scanning next week's opportunities... ~30 sec ⏳",
-        }.get(session, "⏳  Analyzing... please wait ~30 sec")
+        elif cmd in ("stop", "unsubscribe"):
+            subscribers.remove(from_number)
+            try:
+                whatsapp.send_message(from_number,
+                    "❌  Unsubscribed. Send *start* to re-subscribe anytime.")
+            except Exception as e:
+                log.error(f"Failed to send unsubscribe reply: {e}")
 
-        whatsapp.send_message(from_number, wait_msg)
-        handle_adhoc(from_number)
-        return jsonify({"status": "ok"})
+        elif cmd == "help":
+            reply = (
+                "📋  *Commands*\n\n"
+                "  *start*  – Subscribe to auto alerts\n"
+                "  *stop*   – Unsubscribe\n"
+                "  *picks*  – Instant stock picks\n"
+                "  *help*   – This menu\n\n"
+                "💡  Or send *any message* for smart picks!\n\n"
+                "  📈 Market hours → Intraday picks\n"
+                "  🌙 Night time   → Tomorrow's watchlist\n"
+                "  📅 Weekend      → Next week picks"
+            )
+            try:
+                whatsapp.send_message(from_number, reply)
+            except Exception as e:
+                log.error(f"Failed to send help reply: {e}")
+
+        else:
+            # ── Any other message → smart ad-hoc picks ───────────────────────
+            subscribers.add(from_number)   # auto-subscribe on first message
+
+            # Acknowledge immediately — Claude takes 20-60s
+            wait_msg = {
+                "market"    : "🔍  Analyzing live market data...\nPicks arriving in ~30 sec ⏳",
+                "pre_open"  : "🌄  Checking pre-market signals...\nPicks arriving in ~30 sec ⏳",
+                "post_close": "📊  Building tomorrow's watchlist...\nPicks arriving in ~30 sec ⏳",
+                "night"     : "🌙  Preparing tomorrow's picks...\nPicks arriving in ~30 sec ⏳",
+                "weekend"   : "📅  Scanning next week's opportunities...\nPicks arriving in ~30 sec ⏳",
+            }.get(session, "⏳  Analyzing... picks arriving in ~30 sec")
+
+            try:
+                whatsapp.send_message(from_number, wait_msg)
+            except Exception as e:
+                log.error(f"Failed to send wait message: {e}")
+
+            # ✅ KEY FIX: spawn background thread → return 200 to Twilio immediately
+            _spawn_adhoc(from_number)
+
+    except Exception as e:
+        # Catch-all: log but always return 200 so Twilio doesn't keep retrying
+        log.error(f"Unhandled webhook error: {e}", exc_info=True)
+
+    return TWIML_OK   # always return TwiML 200
 
 
 # ─── REST endpoints ──────────────────────────────────────────────────────────
@@ -391,9 +430,9 @@ def list_subscribers():
     subs = subscribers.get_all()
     return jsonify({"subscribers": subs, "count": len(subs)})
 
-@app.route("/trigger/<slot>", methods=["GET", "POST"])
+@app.route("/trigger/<slot>", methods=["POST"])
 def trigger_alert(slot):
-    """Manual trigger: open | 10am | 11am | noon | 1pm | 2pm | 230pm | closing"""
+    """Manual trigger: open | 10am | 11am | noon | 1pm | 2pm | 230pm | closing | night | weekend"""
     mapping = {
         "open"    : (9,  20),
         "10am"    : (10,  0),
@@ -407,7 +446,7 @@ def trigger_alert(slot):
         "weekend" : None,
     }
     if slot not in mapping:
-        return jsonify({"error": f"Unknown slot. Use: {list(mapping.keys())}"}), 400
+        return jsonify({"error": f"Unknown slot. Options: {list(mapping.keys())}"}), 400
 
     try:
         if slot == "night":
@@ -421,6 +460,7 @@ def trigger_alert(slot):
             run_scheduled_alert(h, m)
         return jsonify({"status": "triggered", "slot": slot})
     except Exception as e:
+        log.error(f"Trigger error: {e}", exc_info=True)
         return jsonify({"error": str(e)}), 500
 
 
