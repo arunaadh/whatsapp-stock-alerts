@@ -123,152 +123,56 @@ scheduler.start()
 log.info(f"✅ Scheduler running – {len(SCHEDULE)} slots Mon-Fri IST")
 
 
-# ─── Message formatters ───────────────────────────────────────────────────────
-def _emoji(sentiment: str) -> str:
-    s = sentiment.lower()
-    if "bullish" in s: return "🟢"
-    if "bearish" in s: return "🔴"
-    if "neutral" in s: return "🟡"
-    return "⚪"
+# ─── Message formatters (compact – stays under Twilio 1600 char limit) ─────────
 
-def _stock_lines(i: int, s: dict, show_hold: bool = True) -> list:
+def _fmt_stock(i: int, s: dict, show_hold: bool = True) -> str:
+    """Single stock block ~65 chars."""
     lines = [
-        f"\n*{i}. {s.get('symbol','?')}*  [{s.get('exchange','NSE')}]",
-        f"   🏷️  {s.get('sector','')}",
-        f"   💡  {s.get('reason','')}",
-        f"   📈  Entry  : ₹{s.get('entry_low','?')} – ₹{s.get('entry_high','?')}",
-        f"   🎯  Target : ₹{s.get('target','?')}  (+{s.get('upside','?')}%)",
-        f"   🛑  SL     : ₹{s.get('stop_loss','?')}",
-        f"   ⚖️   R:R    : {s.get('risk_reward','1:2')}",
+        f"{i}. {s.get('symbol','?')} [{s.get('exchange','NSE')}]",
+        f"Entry  : ₹{s.get('entry_low','?')} – ₹{s.get('entry_high','?')}",
+        f"Target : ₹{s.get('target','?')}",
+        f"SL     : ₹{s.get('stop_loss','?')}",
     ]
     if show_hold:
-        lines.append(f"   ⏱  Hold   : {s.get('holding_period','Intraday')}")
-    return lines
+        lines.append(f"Hold   : {s.get('holding_period','Intraday')}")
+    return "\n".join(lines)
 
-def _header(title: str, report: dict) -> list:
-    dt = now_ist()
-    return [
-        f"*{title}*",
-        f"📅  {dt.strftime('%d %b %Y, %I:%M %p IST')}",
-        f"📊  Sentiment : {report.get('sentiment','N/A')} {_emoji(report.get('sentiment',''))}",
-        f"📉  Nifty     : {report.get('nifty_level','N/A')}",
-    ]
-
-def _footer(report: dict, extras: list = None) -> list:
-    lines = []
-    if report.get("sectors_to_watch"):
-        lines.append(f"\n👀  *Watch* : {', '.join(report['sectors_to_watch'])}")
-    if report.get("avoid_sectors"):
-        lines.append(f"🚫  *Avoid* : {', '.join(report['avoid_sectors'])}")
-    if extras:
-        lines += extras
-    lines += ["", f"⚠️  {report.get('disclaimer','For educational purposes only. DYOR.')}"]
-    return lines
-
-def _divider(title: str) -> list:
-    return ["", "━━━━━━━━━━━━━━━━━━━━━━", f"🎯  *{title}*", "━━━━━━━━━━━━━━━━━━━━━━"]
+def _build(header: str, stocks: list, show_hold: bool = True, note: str = "") -> str:
+    """Assemble header + stock blocks and hard-truncate to 1590 chars."""
+    parts = [header]
+    for i, s in enumerate(stocks[:3], 1):
+        parts.append("\n" + _fmt_stock(i, s, show_hold))
+    if note:
+        parts.append("\n" + note)
+    msg = "\n".join(parts)
+    return msg[:1590]          # safety truncation – never exceed Twilio limit
 
 def format_scheduled_message(report: dict, label: str, mode: str) -> str:
-    lines = _header(label, report)
-    if report.get("theme"):
-        lines.append(f"📰  {report['theme']}")
-    if mode == "open":
-        lines += _divider("TOP PICKS – TODAY")
-    elif mode == "closing":
-        lines += _divider("SWING TRADE PICKS")
-        if report.get("day_summary"):
-            lines.insert(4, f"📋  {report['day_summary']}")
-    else:
-        lines += _divider("LIVE INTRADAY PICKS")
-    for i, s in enumerate(report.get("stocks", [])[:3], 1):
-        lines += _stock_lines(i, s, show_hold=(mode != "intraday"))
-    extras = []
-    if mode == "closing" and report.get("next_day_outlook"):
-        extras.append(f"\n🔭  *Tomorrow* : {report['next_day_outlook']}")
-    if report.get("global_cues"):
-        extras.append(f"🌐  *Global*   : {report['global_cues']}")
-    lines += _footer(report, extras)
-    return "\n".join(lines)
+    dt  = now_ist().strftime("%d %b %I:%M %p")
+    hdr = f"{label} | {dt} IST"
+    return _build(hdr, report.get("stocks", []), show_hold=(mode != "intraday"))
 
 def format_adhoc_message(report: dict) -> str:
-    lines = _header("📲  INSTANT PICKS", report)
-    lines += _divider("BEST PICKS RIGHT NOW")
-    for i, s in enumerate(report.get("stocks", [])[:3], 1):
-        lines += _stock_lines(i, s)
-    lines += _footer(report)
-    return "\n".join(lines)
+    dt  = now_ist().strftime("%d %b %I:%M %p")
+    hdr = f"Picks | {dt} IST"
+    return _build(hdr, report.get("stocks", []))
 
 def format_pre_open_message(report: dict) -> str:
-    lines = _header("🌄  PRE-MARKET WATCHLIST", report)
-    lines.append(f"⏰  Gift Nifty : {report.get('nifty_open_estimate','N/A')}")
-    lines += _divider("STOCKS TO WATCH TODAY")
-    for i, s in enumerate(report.get("stocks", [])[:3], 1):
-        lines += _stock_lines(i, s)
-    extras = []
-    if report.get("key_events"):
-        extras.append(f"\n📋  Key Events : {report['key_events']}")
-    lines += _footer(report, extras)
-    return "\n".join(lines)
+    dt   = now_ist().strftime("%d %b %I:%M %p")
+    hdr  = f"Pre-Market | {dt} IST"
+    note = f"Gift Nifty: {report.get('nifty_open_estimate','N/A')}"
+    return _build(hdr, report.get("stocks", []), note=note)
 
 def format_night_message(report: dict) -> str:
-    stocks = report.get("stocks", [])
-    dt     = now_ist()
-    lines  = [
-        "🌙  *TOMORROW'S WATCHLIST*",
-        f"📅  {dt.strftime('%d %b %Y, %I:%M %p IST')}",
-        f"📊  Tomorrow's Outlook : {report.get('sentiment','N/A')} {_emoji(report.get('sentiment',''))}",
-        f"📰  Theme : {report.get('theme','')}",
-    ]
-    lines += _divider("BUY TOMORROW – TOP PICKS")
-    for i, s in enumerate(stocks[:4], 1):
-        lines += [
-            f"\n*{i}. {s.get('symbol','?')}*  [{s.get('exchange','NSE')}]",
-            f"   🏷️  {s.get('sector','')}",
-            f"   💡  {s.get('reason','')}",
-            f"   📈  Entry Tmr  : ₹{s.get('entry_low','?')} – ₹{s.get('entry_high','?')}",
-            f"   🎯  Target     : ₹{s.get('target','?')}  (+{s.get('upside','?')}%)",
-            f"   🛑  SL         : ₹{s.get('stop_loss','?')}",
-            f"   ⏱  Horizon    : {s.get('holding_period','2-3 days')}",
-        ]
-    lines += [
-        "",
-        f"🌐  *Global Cues*    : {report.get('global_cues','N/A')}",
-        f"📋  *Key Events*     : {report.get('key_events','N/A')}",
-        f"📉  *Nifty Open Est* : {report.get('nifty_open_estimate','N/A')}",
-        "",
-        "⏰  _Set price alerts at entry levels. Check pre-market at 9 AM._",
-        "",
-        f"⚠️  {report.get('disclaimer','For educational purposes only. DYOR.')}",
-    ]
-    return "\n".join(lines)
+    dt  = now_ist().strftime("%d %b %I:%M %p")
+    hdr = f"Tomorrow Picks | {dt} IST"
+    note = f"Nifty est: {report.get('nifty_open_estimate','N/A')}"
+    return _build(hdr, report.get("stocks", []), note=note)
 
 def format_weekend_message(report: dict) -> str:
-    stocks = report.get("stocks", [])
-    dt     = now_ist()
-    lines  = [
-        "📅  *WEEKEND WATCHLIST*",
-        f"📅  {dt.strftime('%d %b %Y, %I:%M %p IST')}",
-        f"📊  Next Week Outlook : {report.get('sentiment','N/A')} {_emoji(report.get('sentiment',''))}",
-    ]
-    lines += _divider("PICKS FOR NEXT WEEK")
-    for i, s in enumerate(stocks[:4], 1):
-        lines += [
-            f"\n*{i}. {s.get('symbol','?')}*  [{s.get('exchange','NSE')}]",
-            f"   🏷️  {s.get('sector','')}",
-            f"   💡  {s.get('reason','')}",
-            f"   📈  Entry  : ₹{s.get('entry_low','?')} – ₹{s.get('entry_high','?')}",
-            f"   🎯  Target : ₹{s.get('target','?')}  (+{s.get('upside','?')}%)",
-            f"   🛑  SL     : ₹{s.get('stop_loss','?')}",
-            f"   ⏱  Hold   : {s.get('holding_period','1 week')}",
-        ]
-    lines += [
-        "",
-        f"📋  *Key Events Next Week* : {report.get('key_events','N/A')}",
-        f"🌐  *Global Watch*         : {report.get('global_cues','N/A')}",
-        "",
-        f"⚠️  {report.get('disclaimer','For educational purposes only. DYOR.')}",
-    ]
-    return "\n".join(lines)
+    dt  = now_ist().strftime("%d %b %I:%M %p")
+    hdr = f"Next Week Picks | {dt} IST"
+    return _build(hdr, report.get("stocks", []))
 
 
 # ─── Smart ad-hoc dispatcher (runs in background thread) ─────────────────────
@@ -468,3 +372,109 @@ def trigger_alert(slot):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
+
+# ─── Debug & Test endpoints ───────────────────────────────────────────────────
+@app.route("/debug", methods=["GET"])
+def debug():
+    """
+    Visit https://your-app.onrender.com/debug to check all config at a glance.
+    Shows masked env vars, subscriber list, and Twilio connectivity test.
+    """
+    import traceback
+
+    # Check env vars (masked)
+    sid   = os.environ.get("TWILIO_ACCOUNT_SID", "")
+    token = os.environ.get("TWILIO_AUTH_TOKEN", "")
+    key   = os.environ.get("ANTHROPIC_API_KEY", "")
+    wa    = os.environ.get("TWILIO_WHATSAPP_NUMBER", "")
+
+    env_status = {
+        "TWILIO_ACCOUNT_SID"    : f"{sid[:6]}…{sid[-4:]}" if len(sid) > 10 else ("❌ MISSING" if not sid else sid),
+        "TWILIO_AUTH_TOKEN"     : f"{token[:4]}…{token[-4:]}" if len(token) > 8 else ("❌ MISSING" if not token else "set"),
+        "ANTHROPIC_API_KEY"     : f"{key[:7]}…{key[-4:]}" if len(key) > 11 else ("❌ MISSING" if not key else "set"),
+        "TWILIO_WHATSAPP_NUMBER": wa if wa else "❌ MISSING",
+    }
+
+    # Test Twilio credentials by fetching account info
+    twilio_ok  = False
+    twilio_err = None
+    try:
+        from twilio.rest import Client
+        c = Client(sid, token)
+        acct = c.api.accounts(sid).fetch()
+        twilio_ok = True
+        twilio_info = f"Account '{acct.friendly_name}' status={acct.status}"
+    except Exception as e:
+        twilio_err = str(e)
+        twilio_info = f"❌ {e}"
+
+    dt = now_ist()
+    return jsonify({
+        "server_time"  : dt.strftime("%d %b %Y %I:%M %p IST"),
+        "session"      : market_session(dt),
+        "env_vars"     : env_status,
+        "twilio"       : {"ok": twilio_ok, "info": twilio_info},
+        "subscribers"  : subscribers.get_all(),
+        "whatsapp_from": os.environ.get("TWILIO_WHATSAPP_NUMBER", "NOT SET"),
+        "hint": (
+            "If twilio.ok is false → check your SID/token in Render env vars. "
+            "If env vars look right but still no reply → make sure you joined "
+            "the sandbox by sending 'join <code>' to +14155238886 on WhatsApp first."
+        )
+    })
+
+
+@app.route("/test/send", methods=["POST"])
+def test_send():
+    """
+    POST /test/send  with JSON body: {"to": "+919XXXXXXXXX", "msg": "hello"}
+    Useful to verify Twilio can actually deliver a message.
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    to   = data.get("to", "").strip()
+    msg  = data.get("msg", "✅ Test message from WhatsApp Stock Bot").strip()
+
+    if not to:
+        return jsonify({"error": "Provide 'to' field with E.164 number e.g. +919XXXXXXXXX"}), 400
+
+    try:
+        sid = whatsapp.send_message(to, msg)
+        return jsonify({"status": "sent", "sid": sid, "to": to})
+    except Exception as e:
+        return jsonify({"status": "error", "error": str(e)}), 500
+
+
+@app.route("/test/webhook", methods=["POST"])
+def test_webhook():
+    """
+    Simulate an incoming WhatsApp message without needing Twilio.
+    POST JSON: {"from": "+919XXXXXXXXX", "body": "hi"}
+    """
+    data        = request.get_json(force=True, silent=True) or {}
+    from_number = data.get("from", "+910000000000").replace("whatsapp:", "").strip()
+    body        = data.get("body", "hi").strip()
+    cmd         = body.lower()
+    dt          = now_ist()
+    session     = market_session(dt)
+
+    log.info(f"🧪 test/webhook [{from_number}] '{body}' session={session}")
+
+    if cmd in ("start", "subscribe", "hi", "hello", "hey"):
+        subscribers.add(from_number)
+        return jsonify({
+            "status"    : "would_send_subscribe_message",
+            "to"        : from_number,
+            "session"   : session,
+            "subscriber_added": True,
+            "all_subscribers" : subscribers.get_all(),
+        })
+    elif cmd in ("stop", "unsubscribe"):
+        subscribers.remove(from_number)
+        return jsonify({"status": "would_send_unsubscribe", "to": from_number})
+    else:
+        return jsonify({
+            "status"   : "would_spawn_adhoc_thread",
+            "to"       : from_number,
+            "session"  : session,
+            "note"     : "In real webhook this fires a background AI analysis thread",
+        })
