@@ -1,7 +1,21 @@
+# ── Core framework ────────────────────────────────────────────────────────────
 flask==3.0.3
-anthropic==0.34.2
+gunicorn==21.2.0
+
+# ── Anthropic SDK – must use >=0.40 for Python 3.11 + httpx 0.27 compatibility
+anthropic==0.40.0
+
+# ── HTTP client – httpx 0.28+ dropped the `proxies` arg that old anthropic used
+httpx==0.27.2
+
+# ── Twilio ────────────────────────────────────────────────────────────────────
 twilio==9.3.2
-apscheduler==3.10.4
+
+# ── Scheduler ─────────────────────────────────────────────────────────────────
+APScheduler==3.10.4
+
+# ── Timezone ──────────────────────────────────────────────────────────────────
 pytz==2024.1
-gunicorn==22.0.0
+
+# ── Other ─────────────────────────────────────────────────────────────────────
 requests==2.32.3
