@@ -1,0 +1,33 @@
+services:
+  - type: web
+    name: whatsapp-stock-alerts
+    runtime: python
+    region: singapore          # closest to India for low latency
+    plan: starter              # upgrade to standard for always-on
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --workers 2 --threads 4 --timeout 120 --bind 0.0.0.0:$PORT
+    healthCheckPath: /health
+
+    # ── Environment Variables ──────────────────────────────────────────────
+    # Set these in the Render dashboard under "Environment"
+    envVars:
+      - key: ANTHROPIC_API_KEY
+        sync: false            # enter value in dashboard
+
+      - key: TWILIO_ACCOUNT_SID
+        sync: false
+
+      - key: TWILIO_AUTH_TOKEN
+        sync: false
+
+      - key: TWILIO_WHATSAPP_NUMBER
+        value: "whatsapp:+18127260699"   # Twilio sandbox number (replace with approved number)
+
+      - key: SUBSCRIBER_FILE
+        value: /tmp/subscribers.json
+
+      - key: PYTHON_VERSION
+        value: "3.11.0"
+
+      - key: TZ
+        value: Asia/Kolkata
