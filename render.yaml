@@ -27,7 +27,7 @@ services:
         value: /tmp/subscribers.json
 
       - key: PYTHON_VERSION
-        value: "3.11.0"
+        value: "3.11.9"
 
       - key: TZ
         value: Asia/Kolkata
